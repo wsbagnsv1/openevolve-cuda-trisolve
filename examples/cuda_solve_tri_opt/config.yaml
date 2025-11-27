@@ -1,0 +1,114 @@
+# Configuration for solve_tri CUDA optimization
+max_iterations: 600
+checkpoint_interval: 8
+log_level: "INFO"
+
+# LLM configuration
+llm:
+  primary_model: "x-ai/grok-4.1-fast:free" #api identifier or the model
+  primary_model_weight: 1.0
+  # secondary_model: "anthropic/claude-3.7-sonnet" Not needed
+  secondary_model_weight: 0.0
+  api_base: "https://openrouter.ai/api/v1" # (any openai compatible api will do)
+  api_key: "xxx" # set your own key
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 28192 # can be increased if need be
+  timeout: 600 
+
+# Prompt configuration
+prompt: # has to updated for your own setup and goal, feel free to teak it!
+  system_message: |
+    You are an expert CUDA programmer specializing in high-performance kernel optimization.
+    Your task is to optimize a CUDA kernel for solving triangular systems (`solve_tri`). The progression hit a wall so be creative with your optimizations.
+    You will be provided with performance profiling data from Nsight Compute for two different NVIDIA GPUs.
+    
+    # Optimization Goals:
+    - **PRIMARY GOAL**: Minimize `us_per_run_dev0` and `us_per_run_dev1` (execution time in microseconds)
+    - Device 0: NVIDIA GeForce RTX 4070 Ti (Compute 8.9) - Target: < 3 us/run
+    - Device 1: NVIDIA GeForce RTX 2070 (Compute 7.5) - Target: < 7 us/run
+    - The combined_score is calculated as the average throughput across both devices
+    - Lower us/run values = Higher combined_score = Better performance
+    
+    # Performance Analysis Data:
+    You will receive detailed Nsight Compute profiling data in the `nsight_profile` artifact.
+    This CSV report contains profiling data from BOTH GPUs (CUDA:0 and CUDA:1).
+    Each row in the CSV corresponds to metrics from one of the devices. Use this report to identify bottlenecks and guide your optimizations.
+    
+    The report contains critical performance metrics including:
+    - SM efficiency and occupancy (per device)
+    - Memory bandwidth utilization and cache hit rates (per device)
+    - Warp execution efficiency and stall reasons (per device)
+    - Shared memory bank conflicts (per device)
+    - Register usage and spill (per device)
+    - Bottleneck identification (per device)
+    
+    **USE THIS DATA** to identify bottlenecks and guide your optimizations. Focus on:
+    - High stall percentages (CPIStall metrics)
+    - Low occupancy or SM utilization
+    - Shared memory bank conflicts
+    - Memory access patterns and cache efficiency
+    - Warp divergence and predication issues
+    - **Compare metrics between the two devices** to understand architecture-specific bottlenecks
+    
+    The kernel is provided in the `cuda_source` string variable.
+    You must modify this string to implement your optimizations.
+    
+    # Constraints:
+    - The kernel must remain mathematically equivalent in terms of output.
+    - The kernel must compile without errors.
+    - You MUST define the `cuda_source` variable containing the valid C++/CUDA code.
+    - YOU must keep the #include "solve_tri.cuh" imports
+    - You CAN ONLY CHANGE THE KERNEL, the launcher should stay the same to prevent compilation errors.
+    - The kernel signature `solve_tri_f32_fast` MUST NOT change.
+    - The kernel must correctly solve the triangular system.
+    - Do not change the external C interface or the macros defining MAX_N/MAX_K unless you handle the logic changes appropriately.
+    
+    # Input/Output:
+    - Input: `initial_program.py` containing the baseline kernel.
+    - Output: A modified python script with the optimized `cuda_source`.
+    
+    # Evolution Block Markers:
+    **CRITICAL**: Your output MUST include the evolution block markers around the cuda_source assignment:
+    - `# EVOLVE-BLOCK-START` must appear BEFORE the `cuda_source = r'''` line
+    - `# EVOLVE-BLOCK-END` must appear AFTER the closing `'''` of the cuda_source
+    These markers are REQUIRED for the evaluation system to function correctly.
+    
+    IMPORTANT: You must output the full Python script inside a ```python``` markdown block.
+    Do not include any explanations or conversational text outside the code block.
+    CRITICAL: Do NOT repeat the word "python" inside the code block. The first line of the code block must be valid Python code (e.g., imports or comments).
+    ALSO CRITICAL: MATHEMATICAL CORRECTNESS IS PARAMOUNT. YOUR KERNEL MUST PRODUCE THE CORRECT RESULTS.
+  num_top_programs: 3
+  use_template_stochasticity: true
+  max_artifact_bytes: 102400  # 100KB limit for Nsight CSV reports
+
+# Database configuration
+database:
+  population_size: 60
+  archive_size: 25
+  num_islands: 4
+  elite_selection_ratio: 0.3
+  exploitation_ratio: 0.7
+
+# Paths configuration
+paths:
+  # has to be set to the llama.cpp source in which you are testing
+  llama_cpp_root: "F:\\Users\\timbe\\Desktop\\test optimization"
+  target_kernel_file: "ggml\\src\\ggml-cuda\\solve_tri.cu"
+  build_dir: "build"
+  # ive done this on windows but this should work fine with changed paths on linux too
+  test_executable: "bin\\Release\\test-backend-ops.exe"
+  # well thats all self explanatory
+  nsight_compute_path: "C:\\Program Files\\NVIDIA Corporation\\Nsight Compute 2025.1.0\\ncu.bat"
+  nsight_base_dir: "C:\\Program Files\\NVIDIA Corporation"
+
+# Evaluator configuration
+evaluator:
+  timeout: 120
+  cascade_evaluation: false # Cascade not implemented in this evaluator
+  parallel_evaluations: 1 # not more since you dont want that multiple benchmarks run at the same time!
+  use_llm_feedback: false
+
+# Evolution settings
+diff_based_evolution: false
+allow_full_rewrites: true
