@@ -1,3 +1,12 @@
+# Open evolve with cuda_solve_tri_opt framework for optimizing the solve tri cuda kernel in llama.cpp
+You have to change the paths in the config.yaml as well as the sysprompt and probably should look into the evaluator script for proper naming or if you only use one gpu. If you use 2 it will work without that but probably will name your cuda devices wrong 😅.
+You can test with any model and open ai compatible api and could test around with parameters, this framework is far from perfect and I created it basically just for fun.
+It should be trivial to also use this for other kernels in llama.cpp but the nsight addon should probably be optimized and integrated in a smarter way, since atm it only optimizes for raw speed which is hard to meassure reliably, it could be optimized to use the nsight results as the optiization parameters instaed of raw speed (;
+
+A lot of thanks to codelion who created Openevolve!
+
+
+
 # OpenEvolve
 
 <div align="center">
