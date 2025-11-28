@@ -4,7 +4,178 @@ import tempfile
 import re
 import importlib.util
 import yaml
+import math
+import shutil
+import datetime
 from openevolve.evaluation_result import EvaluationResult
+
+
+# Metrics configuration from filter_report.py
+METRICS_CONFIG = {
+    # --- 1. THE COST (Overhead) ---
+    "Executed Instructions": {
+        "str": '"Instruction Statistics","Executed Instructions","inst","',
+        "weight": 2.5,   # INCREASED: Penalize instruction bloat significantly
+        "higher_is_better": False,
+        "use_for_score": True
+    },
+    
+    # --- 2. THE POTENTIAL BENEFIT (Memory Efficiency) ---
+    "L2 Hit Rate": {
+        "str": '"Memory Workload Analysis","L2 Hit Rate","%","',
+        "weight": 3.0,   # KEEP HIGH: This is your most honest structural metric
+        "higher_is_better": True,
+        "use_for_score": True
+    },
+    "L1/TEX Cache Throughput": {
+        "str": '"GPU Speed Of Light Throughput","L1/TEX Cache Throughput","%","',
+        "weight": 1.0,
+        "higher_is_better": True,
+        "use_for_score": True
+    },
+    
+    # --- 3. THE SAFETY RAIL (Speed & Utilization) ---
+    "Duration": {
+        "str": '"GPU Speed Of Light Throughput","Duration","ns","',
+        "weight": 4.0,   # INCREASED: The ultimate veto. If this doubles, score tanks.
+        "higher_is_better": False,
+        "use_for_score": True
+    },
+    "Compute (SM) Throughput": {
+        "str": '"GPU Speed Of Light Throughput","Compute (SM) Throughput","%","',
+        "weight": 1.5,
+        "higher_is_better": True,
+        "use_for_score": True
+    },
+
+    # --- 4. THE STABLE BASELINE (Always Optimize) ---
+    "Eligible Warps Per Scheduler": {
+        "str": '"Scheduler Statistics","Eligible Warps Per Scheduler","warp","',
+        "weight": 1.5,   # SLIGHT INCREASE: Reward breaking the 0.140 barrier
+        "higher_is_better": True,
+        "use_for_score": True
+    },
+    "Avg. Active Threads": {
+        "str": '"Warp State Statistics","Avg. Active Threads Per Warp","","',
+        "weight": 1.0,   # LOWERED: Usually static at 32, rarely differentiates
+        "higher_is_better": True,
+        "use_for_score": True
+    },
+    "Avg. Divergent Branches": {
+        "str": '"Source Counters","Avg. Divergent Branches","","',
+        "weight": 1.0,
+        "higher_is_better": False,
+        "use_for_score": True
+    },
+    
+    # --- 5. MINOR INDICATORS ---
+    "Shared Memory Throughput": {
+        "str": '"Memory Workload Analysis","Shared Memory Throughput","byte/s","', 
+        "weight": 0.5,
+        "higher_is_better": True,
+        "use_for_score": True
+    },
+    "DRAM Throughput": {
+        "str": '"Memory Workload Analysis","Memory Throughput","byte/s","',
+        "weight": 0.5, 
+        "higher_is_better": False, # NOTE: Usually high throughput is good, but keeping your pref.
+        "use_for_score": True
+    },
+
+    # --- 6. STRUCTURAL LIMITS ---
+    "Registers Per Thread": {
+        "str": '"Launch Statistics","Registers Per Thread","register/thread","',
+        "weight": 1.0, 
+        "higher_is_better": False,
+        "use_for_score": True
+    },
+    "Warp Cycles Per Inst": {
+        "str": '"Warp State Statistics","Warp Cycles Per Issued Instruction","cycle","',
+        "weight": 3.0,   # LOWERED: From 5.0 to 3.0 to reduce "busy work" bias
+        "higher_is_better": False,
+        "use_for_score": True
+    },
+    "Theoretical Occupancy": {
+        "str": '"Occupancy","Theoretical Occupancy","%","',
+        "weight": 0.5,   # LOWERED: It's a ceiling, not a performance guarantee
+        "higher_is_better": True,
+        "use_for_score": True
+    }
+}
+
+def calculate_combined_score(csv_data):
+    """
+    Calculate balanced score from Nsight Compute CSV data.
+    Returns: (combined_score, metrics_dict)
+    """
+    results = {name: [] for name in METRICS_CONFIG}
+    
+    # Parse CSV data
+    for line in csv_data.split('\n'):
+        line = line.strip()
+        for name, config in METRICS_CONFIG.items():
+            search_string = config["str"]
+            if search_string in line:
+                try:
+                    parts = line.split(search_string)
+                    if len(parts) > 1:
+                        value_str = parts[1].split('",')[0].replace('.', '').replace(',', '.')
+                        val = float(value_str)
+                        results[name].append(val)
+                except ValueError:
+                    pass
+    
+    # Calculate averages
+    averages = {}
+    for name in sorted(results.keys()):
+        values = results[name]
+        if values:
+            avg = sum(values) / len(values)
+            averages[name] = avg
+    
+    # Calculate balanced score using weighted logarithmic formula
+    score = 0
+    for name, config in METRICS_CONFIG.items():
+        if not config["use_for_score"]:
+            continue
+            
+        val = averages.get(name)
+        if val is None:
+            val = 0.000001
+        safe_val = val if val > 0.000001 else 0.000001
+        
+        term = config["weight"] * math.log10(safe_val)
+        
+        if config["higher_is_better"]:
+            score += term
+        else:
+            score -= term
+    
+    # Offset for display
+    combined_score = score + 50
+    
+    return combined_score, averages
+
+
+def save_program_to_logs(program_path):
+    """Save the program being evaluated to logs with timestamp-based filename."""
+    try:
+        # Find the logs directory
+        example_dir = os.path.dirname(os.path.abspath(__file__))
+        logs_dir = os.path.join(example_dir, "openevolve_output", "logs")
+        
+        # Create logs directory if it doesn't exist
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        # Generate timestamp-based filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        destination = os.path.join(logs_dir, f"program_{timestamp}.py")
+        
+        # Copy the program
+        shutil.copy2(program_path, destination)
+        print(f"Saved program as: program_{timestamp}.py")
+    except Exception as e:
+        print(f"Warning: Could not save program to logs: {e}")
 
 
 def load_config():
@@ -24,6 +195,9 @@ def evaluate(program_path):
     Args:
         program_path (str): Path to the python file containing the evolved kernel.
     """
+    # Save program to logs directory with timestamp
+    save_program_to_logs(program_path)
+    
     # Sanitize the file content before importing
     try:
         with open(program_path, "r", encoding='utf-8') as f:
@@ -191,12 +365,6 @@ def evaluate(program_path):
             check=False
         )
 
-        # print("--- Correctness Check Output ---")
-        # print(correctness_result.stdout)
-        # if correctness_result.stderr:
-        #     print("--- Correctness Check Errors ---")
-        #     print(correctness_result.stderr)
-
         if correctness_result.returncode != 0:
              return EvaluationResult(
                 metrics={"error": "Correctness check failed (nonzero exit)", "combined_score": 0.0},
@@ -216,6 +384,7 @@ def evaluate(program_path):
              # Fallback if output format is completely unexpected
              if "OK" not in correctness_result.stdout:
                  return EvaluationResult(
+
                     metrics={"error": "Correctness check failed (no 'tests passed' or 'backends passed' found)", "combined_score": 0.0},
                     artifacts={"stdout": correctness_result.stdout}
                 )
@@ -249,113 +418,44 @@ def evaluate(program_path):
             artifacts={"stderr": str(e)}
         )
 
-    # 4. Performance Benchmark
+    # 4. Performance Benchmark (Console-Only Information)
+    # Single run on dev1 for informational purposes - not sent to LLM
     perf_cmd = [test_backend_ops, "perf", "-o", "SOLVE_TRI"]
     
-    num_runs = 25
-    total_throughput_score = 0.0
+    print(f"--- Performance Benchmark (Dev1 Only - Console Info) ---")
     
-    # List of lists to store us/run for each device across runs
-    # We don't know how many devices yet, will initialize on first run
-    per_device_us_runs = [] 
-    
-    print(f"--- Starting {num_runs}x Performance Benchmark ---")
-    
-    for run_idx in range(num_runs):
-        try:
-            perf_result = subprocess.run(
-                perf_cmd,
-                cwd=os.path.dirname(test_backend_ops),
-                capture_output=True,
-                text=True,
-                timeout=256,
-                check=False
-            )
-            
-            if perf_result.returncode != 0:
-                print(f"Run {run_idx+1}/{num_runs} failed.")
-                if perf_result.stderr:
-                    print(perf_result.stderr)
-                return EvaluationResult(
-                    metrics={"error": f"Performance benchmark failed on run {run_idx+1}", "combined_score": 0.0},
-                    artifacts={"stderr": perf_result.stderr, "stdout": perf_result.stdout}
-                )
-            
-            
-            # Log first run output for debugging
-            # if run_idx == 0:
-            #     print("--- Performance Benchmark Output (Run 1) ---")
-            #     print(perf_result.stdout)
-            #     if perf_result.stderr:
-            #         print("--- Performance Benchmark Errors/Warnings (Run 1) ---")
-            #         print(perf_result.stderr)
-
-            # Parse output
-            us_runs = re.findall(r"([\d\.]+)\s+us/run", perf_result.stdout)
-            
-            if not us_runs:
-                 print(f"Run {run_idx+1}/{num_runs}: No performance data found.")
-                 return EvaluationResult(
-                    metrics={"error": "No performance data found", "combined_score": 0.0},
-                    artifacts={"stdout": perf_result.stdout}
-                )
-            
-            # Convert to floats
-            us_runs = [float(x) for x in us_runs]
-            
-            # Initialize per_device storage if needed
-            if not per_device_us_runs:
-                per_device_us_runs = [[] for _ in us_runs]
-            
-            # Store values
-            for dev_idx, val in enumerate(us_runs):
-                if dev_idx < len(per_device_us_runs):
-                    per_device_us_runs[dev_idx].append(val)
-            
-            # Removed per-run logging as requested
-
-        except subprocess.TimeoutExpired:
-            return EvaluationResult(
-                metrics={"error": "Performance benchmark timeout", "combined_score": 0.0},
-                artifacts={"stderr": "Performance benchmark took too long."}
-            )
-        except Exception as e:
-            return EvaluationResult(
-                metrics={"error": "Performance benchmark execution failed", "combined_score": 0.0},
-                artifacts={"stderr": str(e)}
-            )
-
-    # Calculate averages and scores
-    avg_us_per_device = []
-    device_scores = []
-    metrics = {}
-    
-    for dev_idx, runs in enumerate(per_device_us_runs):
-        if runs:
-            avg_us = sum(runs) / len(runs)
-            avg_us_per_device.append(avg_us)
-            # Include metrics and scores for all devices
-            metrics[f"us_per_run_dev{dev_idx}"] = avg_us
-            dev_score = 1000.0 / (avg_us + 1e-6)
-            device_scores.append(dev_score)
+    try:
+        # Set environment to only use dev1
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = "1"
+        
+        perf_result = subprocess.run(
+            perf_cmd,
+            cwd=os.path.dirname(test_backend_ops),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            env=env
+        )
+        
+        if perf_result.returncode != 0:
+            print(f"Warning: Performance benchmark failed (exit code {perf_result.returncode})")
+            if perf_result.stderr:
+                print(perf_result.stderr)
         else:
-            avg_us_per_device.append(0.0)
+            # Log full output for console info
+            print(perf_result.stdout)
 
-    # Combined score is the average of per-device scores (50:50 weight if 2 devices)
-    if device_scores:
-        combined_score = sum(device_scores) / len(device_scores)
-    else:
-        combined_score = 0.0
+    except subprocess.TimeoutExpired:
+        print("Warning: Performance benchmark timed out")
+    except Exception as e:
+        print(f"Warning: Performance benchmark failed: {e}")
 
-    print(f"--- Benchmark Complete ---")
-    print(f"Per-device averages (us/run): {avg_us_per_device}")
-    print(f"Per-device scores: {device_scores}")
-    print(f"Combined Score: {combined_score:.4f}")
-
-    # 5. Nsight Compute Profiling
+    # 5. Nsight Compute Profiling (Dev1 Only)
     nsight_profile = ""
     try:
-        print("--- Starting Nsight Compute Profiling ---")
+        print("--- Starting Nsight Compute Profiling (Dev1 Only) ---")
         
         # Find ncu executable
         ncu_exe = "ncu"
@@ -379,84 +479,59 @@ def evaluate(program_path):
                                 ncu_exe = potential_ncu
                                 break
         
-        # Profile both CUDA devices separately
-        combined_profile = ""
-        csv_header = None
-        all_data_rows = []
+        # Profile only Device 1 (RTX 2070)
+        device_id = 1
+        # Use absolute path for report
+        report_path = os.path.join(os.path.dirname(test_backend_ops), f"nsight_profile_dev{device_id}.csv")
         
-        for device_id in [0, 1]:  # CUDA:0 (RTX 4070 Ti) and CUDA:1 (RTX 2070)
-            device_name = "RTX 4070 Ti" if device_id == 0 else "RTX 2070"
-            print(f"--- Profiling Device {device_id} ({device_name}) ---")
-            
-            # Create temp path for this device's report
-            report_path = os.path.join(tempfile.gettempdir(), f"nsight_profile_dev{device_id}.csv")
-            
-            # Run Nsight Compute profiling with CUDA_VISIBLE_DEVICES
-            ncu_cmd = [
-                ncu_exe,
-                "--csv",
-                "--log-file", report_path,
-                "--set", "full",
-                "--launch-count", "1",
-                test_backend_ops,
-                "perf",
-                "-o", "SOLVE_TRI"
-            ]
-            
-            # Set environment to profile only this device
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(device_id)
-            
-            ncu_result = subprocess.run(
-                ncu_cmd,
-                cwd=os.path.dirname(test_backend_ops),
-                capture_output=True,
-                text=True,
-                timeout=180,  # 3 minutes timeout for profiling
-                check=False,
-                env=env
-            )
-            
-            if ncu_result.returncode != 0:
-                print(f"Warning: Device {device_id} profiling completed with code {ncu_result.returncode}")
-            
-            # Read and parse this device's CSV
-            if os.path.exists(report_path):
-                with open(report_path, 'r', encoding='utf-8') as f:
-                    device_csv = f.read()
-                
-                # Split into lines and separate header from data
-                lines = device_csv.strip().split('\n')
-                if lines:
-                    if csv_header is None:
-                        # First device - save the header
-                        csv_header = lines[0]
-                    
-                    # Collect data rows (skip header line)
-                    if len(lines) > 1:
-                        all_data_rows.extend(lines[1:])
-                
-                print(f"Device {device_id}: {len(lines)-1 if len(lines) > 1 else 0} data rows")
-                
-                # Clean up temp file
-                try:
-                    os.remove(report_path)
-                except:
-                    pass
-            else:
-                print(f"Warning: Device {device_id} profile report not found")
+        # Run Nsight Compute profiling with CUDA_VISIBLE_DEVICES
+        ncu_cmd = [
+            ncu_exe,
+            "--csv",
+            "--log-file", report_path,
+            "--set", "full",
+            "--launch-count", "50",
+            test_backend_ops,
+            "perf",
+            "-o", "SOLVE_TRI"
+        ]
         
-        # Combine all CSV data
-        if csv_header and all_data_rows:
-            combined_profile = csv_header + '\n' + '\n'.join(all_data_rows)
+        # Set environment to profile only dev1
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        
+        ncu_result = subprocess.run(
+            ncu_cmd,
+            cwd=os.path.dirname(test_backend_ops),
+            capture_output=True,
+            text=True,
+            timeout=180,  # 3 minutes timeout for profiling
+            check=False,
+            env=env
+        )
+        
+        if ncu_result.returncode != 0:
+            print(f"Warning: Profiling completed with code {ncu_result.returncode}")
+        
+        # Read the CSV
+        if os.path.exists(report_path):
+            with open(report_path, 'r', encoding='utf-8') as f:
+                nsight_profile = f.read()
+            
+            lines = nsight_profile.strip().split('\n')
+            data_rows = len(lines) - 1 if len(lines) > 1 else 0
             print(f"--- Nsight Profiling Complete ---")
-            print(f"Combined profile: {len(all_data_rows)} total data rows from 2 devices")
-            print(f"Total report size: {len(combined_profile)} bytes")
+            print(f"Collected {data_rows} data rows")
+            print(f"Report size: {len(nsight_profile)} bytes")
+            
+            # Clean up temp file
+            try:
+                os.remove(report_path)
+            except:
+                pass
         else:
-            print("Warning: No Nsight profile data collected")
-            combined_profile = "Profile report not generated"
-        
-        nsight_profile = combined_profile
+            print(f"Warning: Profile report not found")
+            nsight_profile = "Profile report not generated"
             
     except subprocess.TimeoutExpired:
         print("Warning: Nsight profiling timed out")
@@ -468,13 +543,43 @@ def evaluate(program_path):
         print(f"Warning: Nsight profiling failed: {e}")
         nsight_profile = f"Profiling failed: {str(e)}"
 
-    return EvaluationResult(
-        metrics={**metrics, "combined_score": combined_score},
-        artifacts={
-            "stdout": f"Averaged over {num_runs} runs. Per-device averages: {avg_us_per_device}",
-            "nsight_profile": nsight_profile
-        }
-    )
+    # Calculate balanced score from Nsight profile
+    if nsight_profile and nsight_profile not in ["Profile report not generated", "Profiling timed out after 180 seconds", "Nsight Compute (ncu) not found in PATH"]:
+        combined_score, metric_averages = calculate_combined_score(nsight_profile)
+        
+        # Print all metrics for console
+        print("\n=== METRICS ===")
+        for name in sorted(metric_averages.keys()):
+            avg = metric_averages[name]
+            if avg > 1000:
+                print(f"{name}: {avg:,.3f}")
+            else:
+                print(f"{name}: {avg:.3f}")
+        
+        print(f"\n=== BALANCED SCORE ===")
+        print(f"Score: {combined_score:.4f}")
+        print("(Weighted score: rewards speed, memory efficiency, and occupancy)")
+        
+        # Build metrics dict for LLM (combined_score + individual metrics)
+        metrics = {"combined_score": combined_score}
+        for name, avg in metric_averages.items():
+            # Use snake_case for metric keys
+            metric_key = name.lower().replace(" ", "_").replace(".", "").replace("/", "_")
+            metrics[metric_key] = avg
+        
+        return EvaluationResult(
+            metrics=metrics,
+            artifacts={"stdout": f"Balanced score calculated from {len(metric_averages)} Nsight metrics"}
+        )
+    else:
+        # Fallback if profiling failed
+        print("\n=== WARNING ===")
+        print("Nsight profiling failed - cannot calculate balanced score")
+        return EvaluationResult(
+            metrics={"error": "Nsight profiling failed", "combined_score": 0.0},
+            artifacts={"stderr": nsight_profile}
+        )
+
 
 
 if __name__ == "__main__":
