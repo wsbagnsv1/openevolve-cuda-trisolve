@@ -1,23 +1,23 @@
 # Configuration for solve_tri CUDA optimization
-max_iterations: 600
+max_iterations: 1200
 checkpoint_interval: 8
 log_level: "INFO"
 
 # LLM configuration
 llm:
-  primary_model: "x-ai/grok-4.1-fast:free" #api identifier or the model
+  primary_model: "x-ai/grok-4.1-fast:free"
   primary_model_weight: 1.0
-  # secondary_model: "anthropic/claude-3.7-sonnet" Not needed
+  # secondary_model: "anthropic/claude-3.7-sonnet"
   secondary_model_weight: 0.0
-  api_base: "https://openrouter.ai/api/v1" # (any openai compatible api will do)
-  api_key: "xxx" # set your own key
+  api_base: "https://openrouter.ai/api/v1"
+  api_key: "xxx"
   temperature: 1.0
   top_p: 0.95
-  max_tokens: 28192 # can be increased if need be
+  max_tokens: 28192
   timeout: 600 
 
 # Prompt configuration
-prompt: # has to updated for your own setup and goal, feel free to teak it!
+prompt:
   system_message: |
     You are an expert CUDA programmer specializing in high-performance kernel optimization.
     Your task is to optimize a CUDA kernel for solving triangular systems (`solve_tri`). The progression hit a wall so be creative with your optimizations.
@@ -30,26 +30,31 @@ prompt: # has to updated for your own setup and goal, feel free to teak it!
     - The combined_score is calculated as the average throughput across both devices
     - Lower us/run values = Higher combined_score = Better performance
     
-    # Performance Analysis Data:
-    You will receive detailed Nsight Compute profiling data in the `nsight_profile` artifact.
-    This CSV report contains profiling data from BOTH GPUs (CUDA:0 and CUDA:1).
-    Each row in the CSV corresponds to metrics from one of the devices. Use this report to identify bottlenecks and guide your optimizations.
+    # Performance Metrics:
+    You will receive these metrics for each iteration:
+    - `balanced_score`: The primary optimization target (weighted logarithmic score)
+    - Individual metrics for analysis:
+      * `executed_instructions`: Instructions executed (lower is better)
+      * `l2_hit_rate`: L2 cache hit percentage (higher is better)
+      * `l1_tex_cache_throughput`: L1/TEX cache utilization (higher is better)
+      * `duration`: Kernel execution time in nanoseconds (lower is better)
+      * `compute_sm_throughput`: SM compute utilization (higher is better)
+      * `eligible_warps_per_scheduler`: Warps available for scheduling (higher is better)
+      * `avg_active_threads`: Average active threads per warp (higher is better)
+      * `avg_divergent_branches`: Divergent branch count (lower is better)
+      * `shared_memory_throughput`: Shared memory usage (higher is better if used)
+      * `dram_throughput`: DRAM bandwidth usage (lower is better)
+      * `registers_per_thread`: Register pressure (lower is better)
+      * `warp_cycles_per_inst`: Cycles per instruction (lower is better)
+      * `theoretical_occupancy`: Maximum possible occupancy (higher is better)
     
-    The report contains critical performance metrics including:
-    - SM efficiency and occupancy (per device)
-    - Memory bandwidth utilization and cache hit rates (per device)
-    - Warp execution efficiency and stall reasons (per device)
-    - Shared memory bank conflicts (per device)
-    - Register usage and spill (per device)
-    - Bottleneck identification (per device)
+    **USE THESE METRICS** to identify bottlenecks and guide your optimizations. Focus on:
+    - Improving cache hit rates (L2 and L1/TEX) through better memory access patterns
+    - Reducing instruction count while maintaining correctness
+    - Increasing compute throughput and occupancy
+    - Minimizing divergent branches and warp stalls
+    - Balancing register usage to maximize occupancy
     
-    **USE THIS DATA** to identify bottlenecks and guide your optimizations. Focus on:
-    - High stall percentages (CPIStall metrics)
-    - Low occupancy or SM utilization
-    - Shared memory bank conflicts
-    - Memory access patterns and cache efficiency
-    - Warp divergence and predication issues
-    - **Compare metrics between the two devices** to understand architecture-specific bottlenecks
     
     The kernel is provided in the `cuda_source` string variable.
     You must modify this string to implement your optimizations.
@@ -80,7 +85,7 @@ prompt: # has to updated for your own setup and goal, feel free to teak it!
     ALSO CRITICAL: MATHEMATICAL CORRECTNESS IS PARAMOUNT. YOUR KERNEL MUST PRODUCE THE CORRECT RESULTS.
   num_top_programs: 3
   use_template_stochasticity: true
-  max_artifact_bytes: 102400  # 100KB limit for Nsight CSV reports
+  max_artifact_bytes: 8048  # Reduced since we only send metrics summary, not raw CSV
 
 # Database configuration
 database:
@@ -92,13 +97,10 @@ database:
 
 # Paths configuration
 paths:
-  # has to be set to the llama.cpp source in which you are testing
   llama_cpp_root: "F:\\Users\\timbe\\Desktop\\test optimization"
   target_kernel_file: "ggml\\src\\ggml-cuda\\solve_tri.cu"
   build_dir: "build"
-  # ive done this on windows but this should work fine with changed paths on linux too
   test_executable: "bin\\Release\\test-backend-ops.exe"
-  # well thats all self explanatory
   nsight_compute_path: "C:\\Program Files\\NVIDIA Corporation\\Nsight Compute 2025.1.0\\ncu.bat"
   nsight_base_dir: "C:\\Program Files\\NVIDIA Corporation"
 
@@ -106,7 +108,7 @@ paths:
 evaluator:
   timeout: 120
   cascade_evaluation: false # Cascade not implemented in this evaluator
-  parallel_evaluations: 1 # not more since you dont want that multiple benchmarks run at the same time!
+  parallel_evaluations: 1
   use_llm_feedback: false
 
 # Evolution settings
