@@ -1,3 +1,4 @@
+python
 """
 CUDA Kernel for Triangular Matrix Solve (solve_tri)
 
@@ -5,10 +6,8 @@ This module contains the CUDA kernel source code for solving triangular systems.
 The goal is to optimize this kernel for performance on NVIDIA GPUs.
 """
 
-# The baseline CUDA kernel code
+# EVOLVE-BLOCK-START
 cuda_source = r'''
-
-
 #include "common.cuh"
 #include "ggml.h"
 #include "solve_tri.cuh"
@@ -16,9 +15,6 @@ cuda_source = r'''
 #define MAX_N_FAST 64
 #define MAX_K_FAST 32
 
-// ======================
-// Fast Kernel (n <= 64, k <= 32) - Warp-based parallel reduction
-// ======================
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
@@ -56,8 +52,7 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
     float *             X_batch = (float *) ((char *) X + i02 * nb2 + i03 * nb3);
 
     __shared__ float sA[MAX_N_FAST * MAX_N_FAST];
-    __shared__ float sX[MAX_N_FAST * MAX_K_FAST];
-    __shared__ float sXt[MAX_K_FAST * MAX_N_FAST];
+    __shared__ float sX[MAX_K_FAST * MAX_N_FAST];
 
     const int offset = threadIdx.x + threadIdx.y * blockDim.x;
 
@@ -69,72 +64,83 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
         }
     }
 
-#pragma unroll
-    for (int i = 0; i < n * k; i += k * WARP_SIZE) {
-        int i0 = i + offset;
-        if (i0 < n * k) {
-            sX[i0] = B_batch[i0];
-        }
-    }
-
-    __syncthreads();
-
-    // Transpose sX (row-major) to sXt (column-major per column)
+    // Warp-wise load B to column-major sX
 #pragma unroll 2
     for (int rr = 0; rr < 2; ++rr) {
         int row = rr * WARP_SIZE + lane;
         if (row < n) {
-            sXt[col_idx * n + row] = sX[row * k + col_idx];
+            sX[col_idx * n + row] = B_batch[row * k + col_idx];
         }
     }
 
     __syncthreads();
 
-    // Forward substitution
-#pragma unroll
-    for (int row = 0; row < n; ++row) {
-        float sum = 0.0f;
+    const int half = WARP_SIZE;
 
-        // First warp
-        {
+    if (n <= half) {
+#pragma unroll
+        for (int row = 0; row < n; ++row) {
+            float sum = 0.0f;
             int j = lane;
             if (j < row) {
-                sum += sA[row * n + j] * sXt[col_idx * n + j];
+                sum += sA[row * n + j] * sX[col_idx * n + j];
             }
+            sum = warp_reduce_sum(sum);
+            if (lane == 0) {
+                const float diag = sA[row * n + row];
+                const float b_val = sX[col_idx * n + row];
+                const float idiv = 1.0f / diag;
+                sX[col_idx * n + row] = fmaf(sum, -idiv, b_val * idiv);
+            }
+            __syncwarp();
         }
-        // Second warp
-        if (row >= WARP_SIZE) {
-            int j = WARP_SIZE + lane;
+    } else {
+        // First half
+#pragma unroll
+        for (int row = 0; row < half; ++row) {
+            float sum = 0.0f;
+            int j = lane;
             if (j < row) {
-                sum += sA[row * n + j] * sXt[col_idx * n + j];
+                sum += sA[row * n + j] * sX[col_idx * n + j];
             }
+            sum = warp_reduce_sum(sum);
+            if (lane == 0) {
+                const float diag = sA[row * n + row];
+                const float b_val = sX[col_idx * n + row];
+                const float idiv = 1.0f / diag;
+                sX[col_idx * n + row] = fmaf(sum, -idiv, b_val * idiv);
+            }
+            __syncwarp();
         }
-
-        sum = warp_reduce_sum(sum);
-
-        if (lane == 0) {
-            const float diag = sA[row * n + row];
-            const float b_val = sXt[col_idx * n + row];
-            sXt[col_idx * n + row] = (b_val - sum) / diag;
+        // Second half
+#pragma unroll
+        for (int row = half; row < n; ++row) {
+            float sum = 0.0f;
+            // First part: all active
+            int j = lane;
+            sum += sA[row * n + j] * sX[col_idx * n + j];
+            // Second part
+            j = half + lane;
+            if (j < row) {
+                sum += sA[row * n + j] * sX[col_idx * n + j];
+            }
+            sum = warp_reduce_sum(sum);
+            if (lane == 0) {
+                const float diag = sA[row * n + row];
+                const float b_val = sX[col_idx * n + row];
+                const float idiv = 1.0f / diag;
+                sX[col_idx * n + row] = fmaf(sum, -idiv, b_val * idiv);
+            }
+            __syncwarp();
         }
     }
 
-    // Transpose back sXt to sX (row-major)
+    // Warp-wise store from column-major sX to X
 #pragma unroll 2
     for (int rr = 0; rr < 2; ++rr) {
         int row = rr * WARP_SIZE + lane;
         if (row < n) {
-            sX[row * k + col_idx] = sXt[col_idx * n + row];
-        }
-    }
-
-    __syncthreads();
-
-#pragma unroll
-    for (int i = 0; i < n * k; i += k * WARP_SIZE) {
-        const int i0 = i + offset;
-        if (i0 < n * k) {
-            X_batch[i0] = sX[i0];
+            X_batch[row * k + col_idx] = sX[col_idx * n + row];
         }
     }
 }
@@ -157,7 +163,6 @@ static void solve_tri_f32_cuda(const float * A,
                                size_t        nb2,
                                size_t        nb3,
                                cudaStream_t  stream) {
-    // n <= 64, k <= 32
     const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
     dim3        threads(WARP_SIZE, k);
     dim3        grid(ne02 * ne03);
@@ -230,5 +235,5 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                        src0->ne[3], src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], dst->nb[2], dst->nb[3],
                        ctx.stream());
 }
-
 '''
+# EVOLVE-BLOCK-END
