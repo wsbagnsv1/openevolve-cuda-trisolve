@@ -2,7 +2,7 @@
 You have to change the paths in the config.yaml as well as the sysprompt and probably should look into the evaluator script for proper gpu handling (it currently uses cuda:1, and also play with the weights in there (ill add them to the config.yaml later on so you dont have to do it in the evaluator, but that will happen later on. You can test with any model and open ai compatible api and could test around with parameters, this framework is far from perfect and I created it basically just for fun.
 It now uses nsight directly to improve kernels, so balance the weights based on your needs, atm only a single test case for the kernel is supported, i plan to work on that as well!
 
-With a few changes this will wor for other kernels as well! 
+With a few changes this will work for other kernels as well! 
 
 A lot of thanks to codelion who created Openevolve!
 
